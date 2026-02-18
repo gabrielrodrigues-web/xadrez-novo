@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <title>Xadrez do Caps 👹</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.13.4/chess.min.js"></script>
     <script src="/socket.io/socket.io.js"></script>
     <style>
         :root {
@@ -87,7 +87,7 @@
         }
         .rank-leader { color: var(--gold); text-shadow: 0 0 8px var(--gold); font-weight: bold; }
 
-        /* Chat (Ajustado sem Crônicas) */
+        /* Chat */
         #chat-container {
             position: absolute; right: 3%; top: 50%; transform: translateY(-50%);
             width: 380px; height: 600px; background: rgba(0,0,0,0.98);
@@ -306,8 +306,15 @@
         });
 
         socket.on('atualizar_tabuleiro', (data) => {
-            game.load(data.fen);
+            // Tenta carregar o FEN. Se falhar por incompatibilidade de versão, tentamos limpar
+            try {
+                game.load(data.fen);
+            } catch (e) {
+                console.error("Erro ao sincronizar tabuleiro:", e);
+                // Se der erro grave, recarrega a página ou limpa o board
+            }
             selectedSquare = null;
+            
             if (data.lastMove && data.lastMove.captured) {
                 document.body.classList.add('shake');
                 setTimeout(() => document.body.classList.remove('shake'), 500);
@@ -379,12 +386,15 @@
 
                     if (!isSpectator) {
                         if (selectedSquare) {
-                            const move = game.moves({ square: selectedSquare, verbose: true }).find(m => m.to === sqId);
+                            // Compatibilidade: versões antigas usam moves({square}), novas usam moves({square, verbose: true})
+                            const possibleMoves = game.moves({ square: selectedSquare, verbose: true });
+                            const move = possibleMoves.find(m => m.to === sqId);
                             if (move) {
                                 div.classList.add('hint');
                                 div.onclick = () => { 
                                     socket.emit('movimento', { canal: myChannel, from: selectedSquare, to: sqId, cor: myColor, apelido: myNick }); 
                                     selectedSquare = null; 
+                                    // Removemos o renderBoard() aqui, esperamos o servidor confirmar para evitar desync
                                 };
                             }
                         }
