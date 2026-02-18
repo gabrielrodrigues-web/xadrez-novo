@@ -8,13 +8,19 @@ const { Chess } = require('chess.js');
 const DB_PATH = './database.json';
 let users = {};
 
-// Carrega o banco de dados
+// Carrega o banco de dados com segurança
 if (fs.existsSync(DB_PATH)) {
-    try { users = JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); } catch (e) { users = {}; }
+    try { 
+        const fileData = fs.readFileSync(DB_PATH, 'utf8');
+        if (fileData) users = JSON.parse(fileData);
+    } catch (e) { 
+        console.error("Erro ao carregar banco de dados, criando novo:", e);
+        users = {}; 
+    }
 }
 function saveDB() { fs.writeFileSync(DB_PATH, JSON.stringify(users, null, 2)); }
 
-// Estrutura das Salas (Universos) - ALTERADO PARA 900s
+// Estrutura das Salas (Universos) - 900s (15 min)
 const rooms = {
     "SubMundo": { players: [], game: null, timer: null, times: { w: 900, b: 900 }, rematch: [] },
     "Recanto dos pecadores": { players: [], game: null, timer: null, times: { w: 900, b: 900 }, rematch: [] },
@@ -34,7 +40,13 @@ function startTimer(canal) {
     if (room.timer) clearInterval(room.timer);
 
     room.timer = setInterval(() => {
-        if (!room.game || room.game.isGameOver()) {
+        // Verificação de segurança para evitar crash se o jogo for anulado
+        if (!room.game || (room.players.filter(p => p.cor !== 'spectator').length < 2)) {
+            clearInterval(room.timer);
+            return;
+        }
+
+        if (room.game.isGameOver()) {
             clearInterval(room.timer);
             return;
         }
@@ -60,7 +72,7 @@ function startTimer(canal) {
             
             io.emit('atualizar_ranking', getRanking());
             io.to(canal).emit('fim_jogo', { msg });
-            room.game = null;
+            // Não deletamos o room.game imediatamente para permitir ver o tabuleiro final
         }
     }, 1000);
 }
@@ -83,8 +95,15 @@ io.on('connection', (socket) => {
         let cor = 'spectator';
         const activePlayers = room.players.filter(p => p.cor !== 'spectator');
         
-        if (activePlayers.length < 2) {
-            const hasWhite = activePlayers.some(p => p.cor === 'w');
+        // Verifica se o jogador já está na sala (reconexão)
+        const existingPlayer = activePlayers.find(p => p.apelido === apelido);
+        if (existingPlayer) {
+             // Lógica de reconexão poderia ir aqui, mas simplificamos removendo o antigo
+             room.players = room.players.filter(p => p.apelido !== apelido);
+        }
+
+        if (room.players.filter(p => p.cor !== 'spectator').length < 2) {
+            const hasWhite = room.players.some(p => p.cor === 'w');
             cor = hasWhite ? 'b' : 'w';
             room.players.push({ id: socket.id, apelido, cor });
         } else {
@@ -93,13 +112,16 @@ io.on('connection', (socket) => {
         }
 
         const playersNow = room.players.filter(p => p.cor !== 'spectator');
-        if (playersNow.length === 2 && !room.game) {
+        
+        // Início de jogo
+        if (playersNow.length === 2 && (!room.game || room.game.isGameOver())) {
             room.game = new Chess();
-            room.times = { w: 900, b: 900 }; // 15 minutos
+            room.times = { w: 900, b: 900 };
             room.rematch = [];
             io.to(canal).emit('iniciar_jogo', { fen: room.game.fen() });
             startTimer(canal);
         } else if (room.game) {
+            // Espectador ou reconexão entra no meio
             socket.emit('iniciar_jogo', { fen: room.game.fen() });
             socket.emit('sync_time', room.times);
         }
@@ -114,11 +136,16 @@ io.on('connection', (socket) => {
     socket.on('movimento', (data) => {
         const room = rooms[data.canal];
         if (!room || !room.game) return;
+        
+        // Validação estrita de turno
         if (room.game.turn() !== data.cor) return;
 
         try {
+            // Tenta realizar o movimento
             const move = room.game.move({ from: data.from, to: data.to, promotion: 'q' });
+            
             if (move) {
+                // Sucesso: atualiza todos
                 io.to(data.canal).emit('atualizar_tabuleiro', { fen: room.game.fen(), lastMove: move });
                 
                 if (room.game.isGameOver()) {
@@ -129,16 +156,28 @@ io.on('connection', (socket) => {
                         const winner = room.game.turn() === 'w' ? 'b' : 'w';
                         const winnerObj = room.players.find(p => p.cor === winner);
                         if (winnerObj) {
-                            users[winnerObj.apelido].wins++;
+                            if(users[winnerObj.apelido]) users[winnerObj.apelido].wins++;
                             saveDB();
                             msg = `XEQUE-MATE! ${winnerObj.apelido} ceifou uma alma.`;
                         }
+                    } else if (room.game.isDraw()) {
+                        msg = "EMPATE! As forças se anularam.";
                     }
+
                     io.emit('atualizar_ranking', getRanking());
                     io.to(data.canal).emit('fim_jogo', { msg });
                 }
+            } else {
+                // Movimento inválido lógico (regras do xadrez)
+                throw new Error("Movimento ilegal");
             }
-        } catch (e) {}
+        } catch (e) {
+            // CORREÇÃO DO CONGELAMENTO:
+            // Se o movimento falhar (erro de parsing ou ilegal), enviamos o estado ATUAL
+            // de volta apenas para quem tentou mover. Isso força a peça a voltar para o lugar.
+            console.log(`Erro no movimento (${data.apelido}):`, e.message);
+            socket.emit('atualizar_tabuleiro', { fen: room.game.fen(), lastMove: null });
+        }
     });
 
     socket.on('pedir_revanche', (data) => {
@@ -154,7 +193,7 @@ io.on('connection', (socket) => {
 
         if (room.rematch.length >= activePlayers.length && activePlayers.length === 2) {
             room.game = new Chess();
-            room.times = { w: 900, b: 900 }; // 15 minutos
+            room.times = { w: 900, b: 900 }; 
             room.rematch = [];
             io.to(data.canal).emit('iniciar_jogo', { fen: room.game.fen() });
             startTimer(data.canal);
@@ -164,11 +203,17 @@ io.on('connection', (socket) => {
     socket.on('disconnecting', () => {
         for (const canal of socket.rooms) {
             if (rooms[canal]) {
+                const wasPlayer = rooms[canal].players.find(p => p.id === socket.id && p.cor !== 'spectator');
                 rooms[canal].players = rooms[canal].players.filter(player => player.id !== socket.id);
-                if (rooms[canal].players.filter(p => p.cor !== 'spectator').length < 2) {
+                
+                // Se um jogador ativo saiu, o jogo acaba/pausa
+                if (wasPlayer) {
                     clearInterval(rooms[canal].timer);
-                    rooms[canal].game = null;
-                    io.to(canal).emit('erro', 'Oponente desconectou. O universo colapsou.');
+                    rooms[canal].game = null; // Encerra o jogo atual
+                    io.to(canal).emit('erro', `Oponente (${wasPlayer.apelido}) fugiu. O universo colapsou.`);
+                    
+                    // Reseta o estado para quem ficou esperar um novo oponente
+                    rooms[canal].rematch = [];
                 }
             }
         }
